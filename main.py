@@ -2,7 +2,7 @@
 # Author: Compugen
 # Date: 2025-09-17
 # Version: 1.0
-# Client: CSSDD
+# Client:  xxxxx
 
 import requests
 import logging
@@ -130,3 +130,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
