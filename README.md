@@ -1,6 +1,10 @@
 # Chromebook → ClearPass Sync
 
-Script Python permettant de **synchroniser automatiquement les Chromebooks Google Workspace** vers **Aruba ClearPass** en ajoutant leurs adresses MAC comme endpoints "Known".
+Script Python permettant de synchroniser automatiquement les Chromebooks de Google Workspace avec Aruba ClearPass.
+
+Si une adresse MAC n’existe pas, elle est ajoutée comme endpoint Known avec l’attribut MDM Enabled: True.
+
+Si une adresse MAC existe déjà mais que l’attribut MDM Enabled est absent, le script met à jour l’entrée pour corriger l’attribut.
 
 ---
 
@@ -17,3 +21,4 @@ Script Python permettant de **synchroniser automatiquement les Chromebooks Googl
 git clone https://github.com/votre-org/chromebook-clearpass-sync.git
 cd chromebook-clearpass-sync
 pip install -r requirements.txt
+
