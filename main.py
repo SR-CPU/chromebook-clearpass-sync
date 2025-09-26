@@ -1,12 +1,14 @@
+# File: main_sync_workspace_cppm.py
 # Script: Chromebook → ClearPass Sync
-# Author: Compugen
-# Date: 2025-09-17
-# Version: 1.0
-# Client:  xxxxx
+# Author: [Compugen]
+# Date: 2025-09-24
+# Version: 1.3 (Ajout de la mise à jour MDM Enabled si manquant)
+# Client: XXXXX
 
 import requests
 import logging
 import warnings
+import os
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from config import (
@@ -38,12 +40,6 @@ class CPPM:
         self.baseurl = f"https://{ip}/api"
         self.access_token = None
 
-    def _auth_headers(self):
-        return {
-            "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "application/json"
-        }
-
     def token(self):
         url = f"{self.baseurl}/oauth"
         payload = {
@@ -52,30 +48,55 @@ class CPPM:
             "client_secret": self.password,
         }
         headers = {"Content-Type": "application/json"}
-        r = self.session.post(url, json=payload, headers=headers,
-                              verify=self.ssl_verify, timeout=10)
+        r = self.session.post(url, json=payload, headers=headers, verify=self.ssl_verify, timeout=20)
         r.raise_for_status()
         self.access_token = r.json()["access_token"]
 
     def endpoint_exists(self, mac):
         url = f"{self.baseurl}/endpoint?filter=%7B%22mac_address%22%3A%20%22{mac}%22%7D"
-        r = self.session.get(url, headers=self._auth_headers(),
-                             verify=self.ssl_verify, timeout=10)
-        return r.status_code == 200 and r.json().get("_embedded", {}).get("items")
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        r = self.session.get(url, headers=headers, verify=self.ssl_verify, timeout=15)
+        if r.status_code == 200:
+            items = r.json().get("_embedded", {}).get("items", [])
+            if items:
+                return items[0]  # retourne les détails de l’endpoint
+        return None
 
     def add_endpoint(self, mac):
         url = f"{self.baseurl}/endpoint"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
         payload = {
             "mac_address": mac,
             "status": "Known",
             "attributes": {"MDM Enabled": True}
         }
-        r = self.session.post(url, json=payload, headers=self._auth_headers(),
-                              verify=self.ssl_verify, timeout=10)
+        r = self.session.post(url, json=payload, headers=headers, verify=self.ssl_verify, timeout=20)
         if r.status_code in (200, 201):
-            logging.info(f"Endpoint ajouté pour {mac}")
+            return True
         else:
-            logging.error(f"Erreur ajout endpoint {mac}: {r.text}")
+            logging.error(f"❌ Erreur ajout endpoint {mac}: {r.text}")
+            return False
+
+    def update_endpoint(self, endpoint_id, mac):
+        url = f"{self.baseurl}/endpoint/{endpoint_id}"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "status": "Known",
+            "attributes": {"MDM Enabled": True}
+        }
+        r = self.session.patch(url, json=payload, headers=headers, verify=self.ssl_verify, timeout=20)
+        if r.status_code == 200:
+            logging.info(f"♻️ Endpoint {mac} mis à jour avec MDM Enabled.")
+            return True
+        else:
+            logging.error(f"❌ Erreur update endpoint {mac}: {r.text}")
+            return False
 
 # --- GOOGLE WORKSPACE FUNCTIONS ---
 def list_chromebooks():
@@ -84,50 +105,94 @@ def list_chromebooks():
     )
     service = build("admin", "directory_v1", credentials=creds)
 
-    results = service.chromeosdevices().list(customer="my_customer", maxResults=100).execute()
-    devices = results.get("chromeosdevices", [])
+    page_token = None
+    macs = []
 
-    chromebooks = []
-    for device in devices:
-        mac = None
-        if "networkInterfaces" in device and device["networkInterfaces"]:
-            mac = device["networkInterfaces"][0].get("macAddress")
-        elif "ethernetMacAddress" in device:
-            mac = device["ethernetMacAddress"]
-        if mac:
-            chromebooks.append(mac.lower())
-    return chromebooks
+    while True:
+        results = service.chromeosdevices().list(
+            customerId="my_customer",
+            maxResults=500,
+            projection="FULL",
+            fields="chromeosdevices(deviceId,ethernetMacAddress,macAddress),nextPageToken",
+            pageToken=page_token
+        ).execute()
+
+        for dev in results.get("chromeosdevices", []):
+            if "ethernetMacAddress" in dev:
+                macs.append(dev["ethernetMacAddress"].lower())
+            if "macAddress" in dev:
+                macs.append(dev["macAddress"].lower())
+
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+
+    return macs
 
 # --- MAIN SCRIPT ---
 def main():
+    device_count_file = "device_count.txt"
+    last_known_count = 0
+
+    if os.path.exists(device_count_file):
+        try:
+            with open(device_count_file, "r") as f:
+                last_known_count = int(f.read().strip())
+        except (IOError, ValueError):
+            logging.warning(f"⚠️ Impossible de lire ou de convertir {device_count_file}. La synchronisation sera exécutée.")
+            last_known_count = 0
+
     try:
+        chromebooks = list_chromebooks()
+        current_count = len(chromebooks)
+
+        if current_count == last_known_count:
+            logging.info(f"✅ Nombre d'appareils ({current_count}) inchangé. Aucune synchronisation nécessaire.")
+            return
+
+        logging.info(f"🔄 Changement détecté : {last_known_count} → {current_count}. Synchronisation en cours...")
+
         cppm = CPPM(CLEARPASS_USER, CLEARPASS_PASS, CLEARPASS_IP)
         cppm.token()
 
-        chromebooks = list_chromebooks()
-        logging.info(f"{len(chromebooks)} Chromebooks récupérés.")
+        added, skipped, updated, errors = 0, 0, 0, 0
+        for mac in chromebooks:
+            try:
+                endpoint = cppm.endpoint_exists(mac)
+                if endpoint:
+                    attrs = endpoint.get("attributes", {})
+                    endpoint_id = endpoint.get("id")
+                    if not attrs.get("MDM Enabled"):
+                        if cppm.update_endpoint(endpoint_id, mac):
+                            updated += 1
+                        else:
+                            errors += 1
+                    else:
+                        skipped += 1
+                else:
+                    if cppm.add_endpoint(mac):
+                        added += 1
+                    else:
+                        errors += 1
+            except Exception as err:
+                logging.error(f"❌ Erreur traitement {mac}: {err}")
+                errors += 1
 
-        # --- MODE TEST : un seul device ---
-        devices_to_process = [chromebooks[0]] if chromebooks else []
-
-        # --- MODE PROD : tous les devices ---
-        # devices_to_process = chromebooks
-
-        added, skipped = 0, 0
-        for mac in devices_to_process:
-            if cppm.endpoint_exists(mac):
-                logging.info(f"Endpoint déjà présent pour {mac}")
-                skipped += 1
-            else:
-                cppm.add_endpoint(mac)
-                added += 1
-
-        logging.info(f"Résumé: {added} endpoints ajoutés, {skipped} déjà existants.")
+        logging.info("=== Résumé du run ===")
+        logging.info(f"📦 Total récupérés : {len(chromebooks)}")
+        logging.info(f"✅ Endpoints ajoutés : {added}")
+        logging.info(f"♻️ Endpoints mis à jour : {updated}")
+        logging.info(f"⏭️ Déjà conformes : {skipped}")
+        logging.info(f"❌ Erreurs : {errors}")
+        logging.info("======================")
+        
+        with open(device_count_file, "w") as f:
+            f.write(str(current_count))
+            logging.info(f"✅ Nouveau nombre d'appareils ({current_count}) sauvegardé.")
 
     except Exception as e:
-        logging.error(f"Erreur: {e}")
+        logging.error(f"Erreur critique: {e}")
 
 
 if __name__ == "__main__":
     main()
-
